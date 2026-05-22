@@ -10,9 +10,9 @@ description: >-
 disable-model-invocation: true
 ---
 
-# Serden's Agentforce Build & Test Playbook
+# Agentforce Build & Test Playbook
 
-Lessons from building the Pasha Sales & Leasing Agent end-to-end: a service agent with Flow-backed actions, Lead/Event creation, and structured SE scenario testing.
+Lessons from building a sales and leasing agent end-to-end: a service agent with Flow-backed actions, Lead/Event creation, and structured SE scenario testing.
 
 ---
 
@@ -57,15 +57,15 @@ This fires deterministically on every turn where the guard evaluates to true —
 
 Salesforce Flow throws `INVALID_OR_NULL_FOR_RESTRICTED_PICKLIST` at runtime if you pass a value that isn't in a restricted picklist. The agent passes LLM-generated text (e.g. `"Multiple"`, `"several projects"`) to Flow inputs mapped to restricted fields. The Flow crashes and the Lead is never created.
 
-**Fix pattern — `fmInterestedProjects` formula with keyword matching:**
+**Fix pattern — `fmInterestedProducts` formula with keyword matching:**
 ```xml
 <formulas>
-    <name>fmInterestedProjects</name>
+    <name>fmInterestedProducts</name>
     <dataType>String</dataType>
     <expression>IF(
-        CONTAINS(LOWER({!interestedProjects}), "crescent"), "The Crescent Residences",
+        CONTAINS(LOWER({!interestedProducts}), "product a"), "Product A",
         IF(
-            CONTAINS(LOWER({!interestedProjects}), "knightsbridge"), "Knightsbridge Residence",
+            CONTAINS(LOWER({!interestedProducts}), "product b"), "Product B",
             ""
         )
     )</expression>
@@ -165,17 +165,17 @@ start_agent topic_selector:
     reasoning:
         instructions: ->
             if @variables.is_verified == True:
-                | Kimliğiniz doğrulandı. Size nasıl yardımcı olabilirim?
+                | Your identity has been verified. How can I help you?
 
             if @variables.is_verified == False:
                 | [normal routing instructions...]
         actions:
             go_to_otp_verification: @utils.transition to @topic.otp_verification
-                description: "Dealer is entering a verification code"
+                description: "User is entering a verification code"
             [... other transitions ...]
 ```
 
-The `is_verified == True` branch fires on the same turn the gate completes (because `is_verified` was just set by the gate's `set` assignment). The hub greets the dealer and asks what they need — the next user utterance is then routed normally.
+The `is_verified == True` branch fires on the same turn the gate completes (because `is_verified` was just set by the gate's `set` assignment). The hub greets the user and asks what they need — the next user utterance is then routed normally.
 
 This pattern applies any time a gate topic transitions to a router via `after_reasoning`. It is documented as an anti-pattern in `/developing-agentforce` `references/agent-script-core-language.md` Section 12.
 
@@ -437,7 +437,7 @@ When a Flow-backed action fails silently (agent says something generic, no Lead/
 2. Or: Setup → search **"Paused and Failed Flow Interviews"** → filter by Flow name
 
 **Via debug logs (most reliable):**
-1. In Setup → Debug Logs, add the **Einstein Agent User** (e.g. `pasha_sales_agent@...ext`) as a traced entity
+1. In Setup → Debug Logs, add the **Einstein Agent User** (e.g. `my_agent@...ext`) as a traced entity
 2. Set log level: Workflow = FINEST, Apex = DEBUG
 3. Re-run the failing utterance via `sf agent preview send` (see §2.3 — not via the browser)
 4. Open the log — search for `FLOW_ELEMENT_ERROR` or the Flow name
@@ -491,7 +491,7 @@ The trace `ActionExecutionStep` shows the exact inputs the agent sent to the Flo
 
 ## Part 4 — Salesforce Admin Setup: Making Custom Fields Visible
 
-Lessons from getting the 9 Pasha Lead qualification fields (created for the agent) to actually appear on the Lead record page for the admin user.
+Lessons from getting custom Lead qualification fields (created for the agent) to actually appear on the Lead record page for the admin user.
 
 ### 4.1 The three-layer visibility stack — all three must be correct
 
@@ -501,7 +501,7 @@ A custom field created by code/CLI is invisible on a record page until **all thr
 |-------|-----------------|--------------|
 | **Field exists in org** | `sf project deploy start` for the field metadata | `sf data query --query "SELECT BudgetMinUSD__c FROM Lead LIMIT 1"` — if it returns without error, the field exists |
 | **Layout section contains the field** | `Layout` metadata deployed to the org | Retrieve the layout (`sf project retrieve start --metadata "Layout:..."`) and confirm the field is in a `<layoutItems>` block |
-| **Profile (or permission set) grants FLS** | `fieldPermissions` in `Profile` or `PermissionSet` metadata | `sf data query --query "SELECT Field, PermissionsRead FROM FieldPermissions WHERE SobjectType = 'Lead' AND Parent.Name = 'Pasha_Data_Admin'"` |
+| **Profile (or permission set) grants FLS** | `fieldPermissions` in `Profile` or `PermissionSet` metadata | `sf data query --query "SELECT Field, PermissionsRead FROM FieldPermissions WHERE SobjectType = 'Lead' AND Parent.Name = 'Agent_Data_Admin'"` |
 
 Newly created custom fields have **no FLS anywhere by default** — they are not automatically visible even to System Administrators. All three layers must be explicitly deployed.
 
@@ -519,7 +519,7 @@ On this SDO org, the Lead object had four active FlexiPages (`SDO_Sales_Lead_Def
 
 ### 4.3 Profile FLS is the floor — permission sets cannot override a missing profile grant
 
-**Root cause of this session's bug:** The `Pasha_Data_Admin` permission set had correct FLS for all 9 fields, was assigned to Serden Eren, and was deployed to the org. Yet the fields were invisible. The System Administrator (Admin) profile had **zero FLS entries** for any of the 9 custom fields — they had never been granted at the profile level.
+**Root cause of this session's bug:** The `Agent_Data_Admin` permission set had correct FLS for all 9 fields, was assigned to the admin user, and was deployed to the org. Yet the fields were invisible. The System Administrator (Admin) profile had **zero FLS entries** for any of the 9 custom fields — they had never been granted at the profile level.
 
 In Salesforce, FLS is additive: a permission set can grant access that the profile doesn't explicitly give. However, if a field has **no FLS entry at all** on the profile (not `false`, just absent), it defaults to hidden. The Admin profile in this SDO org returned 0 rows from:
 
@@ -548,9 +548,9 @@ sf data query --query "SELECT Field, PermissionsRead, PermissionsEdit \
     'Lead.PreferredPropertyType__c','Lead.QualificationSummary__c')" \
   --target-org <alias>
 
-# Check permission set FLS — should already be present in Pasha_Data_Admin
+# Check permission set FLS — should already be present in Agent_Data_Admin
 sf data query --query "SELECT Field, PermissionsRead FROM FieldPermissions \
-  WHERE SobjectType = 'Lead' AND Parent.Name = 'Pasha_Data_Admin'" \
+  WHERE SobjectType = 'Lead' AND Parent.Name = 'Agent_Data_Admin'" \
   --target-org <alias>
 ```
 
@@ -558,7 +558,7 @@ Both queries must return 9 rows before the fields will be visible.
 
 ### 4.4 SDO orgs have an unrecognised metadata type that breaks `sf project deploy start`
 
-This SDO org contains `force-app/main/default/externalClientApps/Pasha_Agent_API.externalClientApplication-meta.xml`. The `sf project deploy start` and `sf project retrieve start` commands fail with `TypeInferenceError` when run from the project root because the CLI cannot resolve `.externalClientApplication` as a known metadata type.
+This SDO org contains `force-app/main/default/externalClientApps/My_Agent_API.externalClientApplication-meta.xml`. The `sf project deploy start` and `sf project retrieve start` commands fail with `TypeInferenceError` when run from the project root because the CLI cannot resolve `.externalClientApplication` as a known metadata type.
 
 **Workaround — use a minimal temp project:**
 ```bash
@@ -614,7 +614,7 @@ To add a two-column section to a classic layout, insert before the first non-dat
     <customLabel>true</customLabel>
     <detailHeading>true</detailHeading>
     <editHeading>true</editHeading>
-    <label>Pasha Qualification</label>
+    <label>Agent Qualification</label>
     <layoutColumns>
         <layoutItems>
             <behavior>Edit</behavior>
