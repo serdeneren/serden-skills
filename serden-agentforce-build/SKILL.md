@@ -244,11 +244,16 @@ Do NOT publish a new agent version just to fix a Flow bug — Flow changes take 
 
 Newly created custom fields have **no FLS anywhere by default** — not automatically visible even to System Administrators.
 
-### 3.2 Profile FLS is the floor — permission sets cannot override a missing profile grant
+### 3.2 FLS is the union of profile + assigned permission sets — grant it in either
 
-If a field has **no FLS entry at all** on the profile (not `false`, just absent), it defaults to hidden. Permission sets alone are insufficient.
+Effective FLS for a user is the **union** of their profile and every assigned permission set; the more permissive grant wins. So a field with **no FLS entry at all** on the profile (not `false`, just absent) defaults to hidden — *unless* an assigned permission set grants it. Two valid ways to make a field visible to a user:
 
-**Diagnostic query to run before declaring FLS "done":**
+- **Permission set** (additive, reversible, no profile edit) — add `fieldPermissions` to a permission set and assign it to the user. This works even when the profile has no entry. Fastest fix, and the only practical option for SDO orgs where editing the profile is painful (§3.3).
+- **Profile** — add `fieldPermissions` to the user's profile and deploy.
+
+> Earlier versions of this playbook claimed "permission sets cannot override a missing profile grant" — that is **wrong**. Permission sets are additive and absolutely can grant FLS the profile lacks. The real-world failure (see §4.5) is granting FLS only to the **agent user's** permission set and forgetting the **human** who views the records.
+
+**Diagnostic query to run before declaring FLS "done"** (checks the profile only; also check assigned permission sets):
 ```bash
 sf data query --query "SELECT Field, PermissionsRead, PermissionsEdit \
   FROM FieldPermissions \
@@ -259,7 +264,7 @@ sf data query --query "SELECT Field, PermissionsRead, PermissionsEdit \
   --target-org <alias>
 ```
 
-Must return one row per field. If 0 rows — add `fieldPermissions` to the `Admin` profile and deploy.
+Must return one row per field for the profile path. If 0 rows, the user can still see the field if an **assigned permission set** grants it — drop the `Parent.IsOwnedByProfile = true` filter to check permission sets too. If neither grants it, either add `fieldPermissions` to the profile and deploy, or add them to a permission set and assign it to the user.
 
 ### 3.3 SDO orgs have an unrecognised metadata type that breaks `sf project deploy start`
 
@@ -364,6 +369,18 @@ Also note: a SOQL "**No such column 'X__c'**" error on a field that *does* exist
 **FLS** symptom for the running user — confirm existence via Tooling API
 `FieldDefinition`, then grant FLS (see §3.2).
 
+**The FLS in this section is for the agent user's *runtime* only — it does NOT make the
+fields visible to humans.** Any **human** who reviews these records in the Salesforce UI
+(the demo presenter, the admin, a service rep) needs FLS **separately**, via their profile
+**or an assigned permission set**, AND the custom fields must be on the **page layout**
+(§3.1, §3.5). Classic miss on a service-agent build: the `{Agent}_Access` permission set
+gives the agent user read/write all along, so the agent works perfectly — but the human
+demoing it opens the Case and the custom fields are invisible (no profile/permset FLS) or
+absent (not on the layout). A System Administrator profile does **not** get FLS on
+metadata-deployed custom fields automatically (§3.1). Quickest fix: assign the same
+`{Agent}_Access` permission set (or a small view-only one) to the human user, and add the
+fields to the layout.
+
 ### 4.6 A record-triggered Flow that sends email rolls back the triggering DML
 
 If invocable Apex inserts a record and an **after-save record-triggered Flow** on that
@@ -451,6 +468,7 @@ and **can it be increased**?") ambiguous — accept it or add a clarifying turn.
 - [ ] All custom fields visible on the record page: layout section added, profile FLS deployed (§3.5)
 - [ ] (Service agent) Tested via `--use-live-actions` as the **agent user**, not just anonymous Apex as admin (§4.4)
 - [ ] (Service agent) Custom PS grants the agent user class access + CRUD/FLS on every object/field the actions write, + `Knowledge__kav` read if used (§4.5)
+- [ ] (Service agent) The **human** demo/admin user — not just the agent user — has FLS (profile or assigned permission set) on every custom field shown in the UI, AND those fields are on the page layout (§4.5, §3.1)
 - [ ] (Service agent) `AgentforceServiceAgentUser` system PS assigned to the agent user BEFORE publish
 - [ ] Record-triggered Flow side-effects (email/callout) run on an **async-after-commit** path so they can't roll back the triggering insert (§4.6)
 - [ ] No reliance on outbound email in unverified trial orgs — Chatter/Task used for demo, email documented for production (§4.7)
