@@ -1,11 +1,13 @@
 ---
 name: serden-agentforce-build
 description: >-
-  Hard-won gotchas from building a production Agentforce agent end-to-end: Agent Script
-  authoring traps, Flow-backed action design, custom field visibility, and admin setup.
-  Use when building or debugging an Agentforce agent, designing Flow backing logic for
-  agent actions, wiring action I/O types, handling picklist safety, or making custom
-  fields visible on record pages. Pairs with /developing-agentforce.
+  Hard-won gotchas from building production Agentforce agents end-to-end: Agent Script
+  authoring traps, Flow-backed action design, custom field visibility, admin setup, and
+  service agents on Financial Services Cloud (FSC) over the email channel (invocable Apex
+  actions, Knowledge grounding, PCC hand-off, email deliverability). Use when building or
+  debugging an Agentforce agent, designing Flow/Apex backing logic for agent actions,
+  wiring action I/O types, handling picklist safety, making custom fields visible, or
+  diagnosing agent-user permission/email/flow failures. Pairs with /developing-agentforce.
 disable-model-invocation: true
 ---
 
@@ -304,6 +306,138 @@ sf org list metadata --metadata-type Layout --target-org <alias> --json \
 
 ---
 
+## Part 4 — Service agents on FSC over the email channel (invocable Apex)
+
+Lessons from building a private-banking **service agent** (`AgentforceServiceAgent`) on a
+Financial Services Cloud trial org: invocable Apex actions, Knowledge grounding, a
+Case + custom-object hand-off, and demo-grade automation.
+
+### 4.1 The CLI generates the `subagent` grammar, not `topic`
+
+`sf agent generate authoring-bundle` (current CLI) scaffolds **`start_agent <router>` +
+`subagent X:` blocks with `@utils.transition to @subagent.X`** — NOT the `topic` grammar
+shown in much of `/developing-agentforce`. Mixing the two breaks compilation.
+
+**Rule:** Open the generated `.agent` file FIRST and match whatever grammar it emitted
+(`subagent` vs `topic`). The `reasoning:` / `actions:` internals are the same; only the
+block keyword and `@subagent.`/`@topic.` reference prefix differ.
+
+### 4.2 Reference an action output as a variable → must capture it first
+
+`{!@variables.X}` in instructions only works for declared **variables**. An action
+**output** (e.g. `accountSummary`) is not a variable. Capture it with `set` into a
+mutable variable, then template that variable:
+```agentscript
+set @variables.account_overview = @outputs.accountSummary   # in the action's set block
+# ...later...
+| Their accounts: {!@variables.account_overview}
+```
+Symptom if you skip it: `CompilationError: 'accountSummary' is not defined in variables`.
+
+### 4.3 Prefer preformatted `string` outputs over typed object/list outputs
+
+Returning a single human-readable, displayable `string` (e.g. a formatted balance/txn
+list) from invocable Apex grounds reliably and **avoids `complex_data_type_name` mapping
+entirely**. Pattern: `summary: string (is_displayable: True)` + `isSuccess: boolean
+(filter_from_agent: True)`. Tell the LLM to "write the exact values from the summary
+field, do not round/paraphrase, and do NOT use the show_command tool."
+
+### 4.4 Test as the AGENT USER, not as admin — they behave differently
+
+Anonymous Apex (`sf apex run`) executes as the **admin**, which masks permission/context
+gaps. The agent runs as the **Einstein Agent User**. Always validate behavior with
+`sf agent preview start --use-live-actions` (runs as the agent user). Things that pass as
+admin but fail/differ as the agent user: object/field CRUD, Knowledge access, and SOSL
+relevance.
+
+### 4.5 Grant the agent user explicit CRUD + FLS on every object/field the actions touch
+
+Invocable Apex reads ran in system mode (queries returned data without object grants),
+but for objects the agent **writes** (Case, custom hand-off object) and their **custom
+fields**, add to the custom `{Agent}_Access` permission set:
+- `<classAccesses>` for every Apex class (required to invoke).
+- `<objectPermissions>` (create/read/edit) for objects the actions insert/update.
+- `<fieldPermissions>` for every custom field written.
+- `<objectPermissions allowRead>` for `Knowledge__kav` if doing Knowledge search.
+
+Also note: a SOQL "**No such column 'X__c'**" error on a field that *does* exist is an
+**FLS** symptom for the running user — confirm existence via Tooling API
+`FieldDefinition`, then grant FLS (see §3.2).
+
+### 4.6 A record-triggered Flow that sends email rolls back the triggering DML
+
+If invocable Apex inserts a record and an **after-save record-triggered Flow** on that
+object runs a synchronous action that throws (e.g. email send fails), the **Apex insert
+is rolled back** inside the same transaction — your action silently "fails" even though
+the parent record (e.g. the Case, inserted earlier and not rolled back by a caught
+exception) persists. Classic split-state symptom: Cases exist, child records don't.
+
+**Fix:** run the side-effect on an **async-after-commit** path so a failure can't roll
+back the trigger:
+```xml
+<start>
+    <object>PCC_Request__c</object>
+    <recordTriggerType>Create</recordTriggerType>
+    <scheduledPaths>
+        <name>Run_Async</name>
+        <connector><targetReference>My_Side_Effect</targetReference></connector>
+        <pathType>AsyncAfterCommit</pathType>
+    </scheduledPaths>
+    <triggerType>RecordAfterSave</triggerType>
+</start>
+```
+Gotcha: an `AsyncAfterCommit` `<scheduledPaths>` must NOT include `<label>` (or
+TimeSource/Offset*) — deploy fails with *"… cannot be set for ScheduledPath of PathType …"*.
+
+**Beware ordering:** an Apex smoke test that passed earlier can start failing once you
+deploy a record-triggered Flow on the same object — the Flow didn't exist during the
+smoke test.
+
+### 4.7 Outbound email is often blocked in trial/demo orgs — use Chatter for demos
+
+Trial orgs frequently have **no verified sending domain and no Org-Wide Email Address**,
+so Flow/Apex `emailSimple` fails with *"your email address domain isn't verified"* and
+(on async paths) emails the admin on every run. For a robust demo, swap `emailSimple` for
+a **Chatter post** (`actionType: chatterPost`, `text` + `subjectNameOrId = {!$Record.Case__c}`)
+— no deliverability dependency, never errors, and it's visible in the UI. Document that
+production reverts to email once a verified Org-Wide Email Address / domain is configured.
+
+### 4.8 SOSL Knowledge search is unreliable across user contexts → score in Apex
+
+SOSL `FIND` relevance can return nothing for long natural-language queries (stopwords,
+`?`) and differs between admin and the agent user. For a small, bounded article set,
+**skip SOSL** and do deterministic in-Apex keyword scoring: query online `Knowledge__kav`,
+split the query into terms (drop stopwords, len ≥ 3), score each article by term hits
+(weight Title higher), return the top match. Reliable and user-context-independent.
+
+### 4.9 `Knowledge User` may be un-settable on the agent user's license
+
+`User.UserPermissionsKnowledgeUser = true` can fail with *"Knowledge User is not allowed
+for this License Type"* for the Einstein Agent User. Grant **`Knowledge__kav` object read
+via the permission set** instead, and run Knowledge Apex `without sharing`.
+
+### 4.10 Route by INTENT (information vs action), not by topic keyword
+
+When the same domain (cards, payment limits, debit orders) appears in both a "service
+request" bucket and a "query" bucket, keyword routing misfires. Instruct the router to
+decide by **what the client wants**: action verbs (order, replace, reverse, increase,
+amend, link, stop) → the request/case path; question forms (what, how, can I, fees,
+steps) → the Knowledge path. Note even this leaves edge phrases (e.g. "what's my limit
+and **can it be increased**?") ambiguous — accept it or add a clarifying turn.
+
+### 4.11 Project & shell setup gotchas
+
+- `sf project generate --name X` creates a **nested `X/` subfolder**; move contents to the
+  repo root if you want a flat project (`setopt dotglob` then `mv X/* .` — **zsh has no
+  `shopt`**).
+- `sf project deploy start` is **atomic**: one failing component rolls back the entire
+  deploy (the "Created" states you see are intended, not committed). Deploy all fixed
+  components together and re-check; don't assume partial save.
+- Apex **reserved words** can't be local variable names — `desc`, `like` fail to compile;
+  use `descTxt`, `likeTerm`.
+
+---
+
 ## Pre-publish diagnostic checklist
 
 - [ ] `sf agent validate authoring-bundle` passes with zero errors
@@ -315,3 +449,9 @@ sf org list metadata --metadata-type Layout --target-org <alias> --json \
 - [ ] All standard picklist values confirmed active in the target org via describe
 - [ ] Session trace `FunctionStep` shows correct inputs and outputs for each action
 - [ ] All custom fields visible on the record page: layout section added, profile FLS deployed (§3.5)
+- [ ] (Service agent) Tested via `--use-live-actions` as the **agent user**, not just anonymous Apex as admin (§4.4)
+- [ ] (Service agent) Custom PS grants the agent user class access + CRUD/FLS on every object/field the actions write, + `Knowledge__kav` read if used (§4.5)
+- [ ] (Service agent) `AgentforceServiceAgentUser` system PS assigned to the agent user BEFORE publish
+- [ ] Record-triggered Flow side-effects (email/callout) run on an **async-after-commit** path so they can't roll back the triggering insert (§4.6)
+- [ ] No reliance on outbound email in unverified trial orgs — Chatter/Task used for demo, email documented for production (§4.7)
+- [ ] `.agent` matches the CLI-generated grammar (`subagent` vs `topic`); action outputs referenced in prompt text are first captured into variables (§4.1, §4.2)
