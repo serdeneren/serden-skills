@@ -678,7 +678,28 @@ sf data query --query "SELECT DeveloperName, MasterLabel FROM CustomNotification
 audit **pre-existing record-triggered flows** on Case/EmailMessage first — a stock demo
 flow with a synchronous, throwing action will silently roll back your new pipeline.
 
-### 5.11 SOQL/CLI gotchas hit while debugging the email channel
+### 5.11 Case owner still wrong after disabling assignment rule — check Automated Case User
+
+Even with the routing address **Case Owner = Einstein Agent User** and all assignment rules
+deactivated, the case may still be assigned to the admin user. The hidden culprit is
+**Setup → Support Settings → Automated Case User**.
+
+This setting controls which user Salesforce impersonates when Email-to-Case processes an
+inbound email internally. If it's set to `System`, Salesforce falls back to assigning the
+case to the **default case owner** (usually the admin) rather than respecting the routing
+address owner setting.
+
+**Fix:** Setup → **Support Settings** → Edit → change **Automated Case User** from `System`
+to `User` → set it to your **admin user** → Save.
+
+The admin user has the permissions required to assign case ownership to the Einstein Agent
+User as specified on the routing address. With `System` it does not.
+
+**Note:** this setting is not queryable via SOQL — configure it via the Setup UI only.
+
+### 5.12 SOQL/CLI gotchas hit while debugging the email channel
+
+
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
@@ -716,3 +737,4 @@ flow with a synchronous, throwing action will silently roll back your new pipeli
 - [ ] (Email channel) Email Template contains the literal `[[[GENERATED_CONTENT]]]` placeholder; Signature + Legal Disclosure filled (§5.7)
 - [ ] (Email channel) **"Notify sender about Email-to-Case processing errors"** enabled while debugging so silent failures surface (§5.9)
 - [ ] (Email channel) Audited **pre-existing record-triggered flows on Case/EmailMessage** (e.g. stock SDO demo flows) — none throws synchronously and rolls back the Email-to-Case insert (§5.10)
+- [ ] (Email channel) Setup → **Support Settings** → **Automated Case User** set to the **admin user** (not `System`) — otherwise case ownership ignores the routing address setting (§5.11)
