@@ -313,7 +313,7 @@ sf org list metadata --metadata-type Layout --target-org <alias> --json \
 
 ## Part 4 — Service agents on FSC over the email channel (invocable Apex)
 
-Lessons from building a private-banking **service agent** (`AgentforceServiceAgent`) on a
+Lessons from building a **service agent** (`AgentforceServiceAgent`) on a
 Financial Services Cloud trial org: invocable Apex actions, Knowledge grounding, a
 Case + custom-object hand-off, and demo-grade automation.
 
@@ -453,6 +453,240 @@ and **can it be increased**?") ambiguous — accept it or add a clarifying turn.
 - Apex **reserved words** can't be local variable names — `desc`, `like` fail to compile;
   use `descTxt`, `likeTerm`.
 
+### 4.12 `agent_type` is IMMUTABLE — switching Employee↔Service is a NEW agent, not an edit
+
+You cannot flip `agent_type` on an existing agent. The type is fixed at creation
+(confirmed in the Agentforce Developer Guide and platform behaviour). Changing
+`AgentforceEmployeeAgent` → `AgentforceServiceAgent` in the same `.agent` config and
+republishing under the same `developer_name` does **not** convert the agent — you must
+create a **new agent with a unique `developer_name`**, which produces a **new BotDefinition
+and a new agent ID (`0Xx...`)**.
+
+Practical recipe (non-destructive, keeps the old agent for rollback):
+1. Copy the bundle to a new folder, e.g. `aiAuthoringBundles/<Name>_Service/<Name>_Service.agent`
+   (+ a copied `.bundle-meta.xml`), reusing all the same `apex://` / `mcpTool://` targets.
+2. Change only the config block: new `developer_name`, `agent_type: "AgentforceServiceAgent"`,
+   add `default_agent_user`. Keep `agent_label` the same if you want the UI name unchanged.
+3. Deploy → preview → publish → activate the new agent; then `sf agent deactivate --api-name <OldName>`.
+4. The auto-generated metadata (`bots/`, `genAiPlanners/`, `genAiPlannerBundles/`,
+   `genAiPlugins/`, `genAiFunctions/`) for the OLD agent stays behind — the new agent
+   generates its own set on publish. Retrieve it afterward only if you want it in git.
+
+Reusing the old name requires deleting the old agent first (destructive) and is rarely
+worth it — downstream callers reference the agent by **ID**, not name (see §4.13).
+
+### 4.13 Headless agents over the Agent API + an external channel (e.g. Telegram via n8n)
+
+An agent can be driven entirely headless through the **Einstein AI Agent REST API**
+(`https://api.salesforce.com/einstein/ai-agent/v1/agents/{agentId}/sessions` then
+`.../sessions/{sessionId}/messages`), with the user-facing channel living **outside**
+Salesforce (n8n bridging Telegram ↔ Agent API). In this setup there is **no native
+Salesforce messaging channel / MIAW / Omni-Channel** to configure — "the messaging
+channel" is just the external bridge.
+
+Key consequences:
+- Auth is a **client-credentials Connected App** (`isClientCredentialEnabled=true`). Scopes
+  `Api` + `Chatbot` work for **both** Employee and Service agents over this endpoint; only
+  move to `sfap_api` / `chatbot_api` if sessions get rejected. The **same** connected app
+  serves a Service agent — you don't need a new one just because the agent type changed.
+- The **agent ID is the coupling point** and is often **hardcoded** in the external client
+  (e.g. an n8n Code node `SF_AGENT_ID`). Because a type switch mints a NEW agent ID (§4.12),
+  the external bridge is **broken until you update that ID**. Always treat "update the
+  hardcoded agent ID + smoke-test the channel end-to-end" as a required migration step, not
+  an afterthought.
+- Employee agents over the Agent API run as the **calling/run-as user**; Service agents run
+  as their `default_agent_user`. Switching to Service is the right move for an
+  external/unauthenticated audience precisely because every end user no longer needs to be a
+  Salesforce user.
+
+### 4.14 MCP-backed actions (`mcpTool://`) — credential access + a preview blind spot
+
+When actions target `mcpTool://<id>` (an MCP server registered via
+`ExternalServiceRegistration` + a `NamedCredential`/`ExternalCredential`), the running
+agent user must be able to use that credential:
+- If the External Credential uses a **Named Principal** (shared OAuth/client-credentials to
+  the MCP server), the agent user usually needs nothing extra.
+- If it uses a **Per-User Principal**, add `UserExternalCredential` object read **and**
+  `<externalCredentialPrincipalAccesses>` to the agent user's custom PS (same pairing as
+  §4.5 / agent-user-setup §3 caveats).
+
+Preview blind spot: `mcpTool://` actions frequently **do not surface** in
+`sf agent preview --authoring-bundle` (the `EnabledToolsStep` comes back empty), so you
+cannot smoke-test them that way. Validate MCP tools by calling the MCP server **directly
+with the official MCP SDK client** (see the test playbook), then confirm end-to-end on the
+published agent. Don't conclude the action is "broken" from an empty preview tool list.
+
+---
+
+## Part 5 — Enabling & debugging the Email channel (Agentforce for Service on Email)
+
+Lessons from taking a **service agent** live on **email** end-to-end on an SDO/trial org.
+The channel = **Agentforce for Service on Email**, which rides on top
+of **Email-to-Case**: inbound email → Case → the agent **owns** the Case → the product
+(not your Flows) sends the conversational reply. The whole thing only fires if the agent
+is the Case owner **synchronously at creation**.
+
+### 5.1 Set the default org per-workspace, not globally
+
+`sf config set target-org <alias>` writes to the project's `.sf/config.json` (Local scope)
+— it does **not** touch global config. Use the **alias**, not the My-Domain URL — passing
+the `*.lightning.force.com` URL fails with *"org … is not authenticated"*. Confirm scope
+with `sf config get target-org --json` → `"location": "Local"`.
+
+### 5.2 No real domain needed for a demo — use the on-demand Email-to-Case address
+
+You do **not** need SPF/DKIM/DMARC or a verified sending domain to demo inbound email.
+Salesforce generates an **on-demand Email-to-Case routing address** (a long
+`…@<hash>.<region>.case.salesforce.com`) that accepts mail immediately. Setup → Email →
+**Deliverability = All email** is enough for the demo. The SPF/DKIM/custom-domain work is
+only for the **outbound** branded "From" address in production.
+
+### 5.3 The routing address's "Email Address" field still must be a REAL, VERIFIED inbox
+
+The Email-to-Case **Routing Address** form has two different addresses — don't confuse them:
+- **Email Address** (what you type): a friendly address that **must be verified**. Salesforce
+  emails a verification link to it. A fake value (`privatebanker@demo.example.com`) leaves the
+  routing address **Verification: Pending**, and inbound mail is silently **not** converted to
+  a Case. Use a real inbox you control (your own `@salesforce.com` or a Gmail) so you can click
+  the link. Status must read **Verified**.
+- **Email Services Address** (auto-generated, long `@…case.salesforce.com`): this is what you
+  actually **send test email to**.
+
+`Accept Email From` blank = accept from any sender (Gmail, corporate, anything) — good for demos.
+
+### 5.4 Send to the EXACT generated address — pull it from the org, don't retype
+
+Typos in the long hash address bounce with *"… is not a valid address"* (a
+`mailer-daemon@mailerdaemon.mta.salesforce.com` reply). Reading it off a screenshot is
+error-prone. Pull it verbatim via SOQL (note: `EmailServicesAddress` has **no `Name`
+field**):
+```bash
+sf data query --query "SELECT LocalPart, EmailDomainName, IsActive FROM EmailServicesAddress" --target-org <alias>
+# send-to address = <LocalPart>@<EmailDomainName>
+```
+
+### 5.5 Case Owner on the routing address = the Einstein Agent User
+
+Set the routing address **Case Owner** to the agent's run-as user (the **Einstein Agent
+User**, e.g. `<agent-run-as-user>@example.com`). The agent only auto-replies if it owns
+the Case at creation (confirms §"Case ownership at creation"). Find the user — it may not
+appear in Setup's default user-list filters but it exists (search by the agent-user
+username prefix or by license type):
+```bash
+sf data query --query "SELECT Id, Name, Username, UserType, IsActive FROM User WHERE Username LIKE '%<agent-user-prefix>%'" --target-org <alias>
+```
+It has a special **Einstein Agent** license / **Einstein Agent User** profile. Confirm it
+can own/create Cases (Create/Read/Edit on Case) via its assigned permission sets:
+```bash
+sf data query --query "SELECT Parent.Label, PermissionsCreate, PermissionsRead, PermissionsEdit FROM ObjectPermissions WHERE SObjectType='Case' AND ParentId IN (SELECT PermissionSetId FROM PermissionSetAssignment WHERE AssigneeId='<agentUserId>')" --target-org <alias>
+```
+
+### 5.6 Add the **Service Email connection** in Agent Builder BEFORE saving the Email Configuration
+
+Setup → **Agentforce for Service on Email** → New Configuration fails to save with:
+> *"Before you save the email configuration, add the email connection in the Agent Builder."*
+
+Fix: open the agent in **Agent Builder** → **Connections** → add **Service Email**, then
+**activate** that agent version. On older SDO orgs the **old connections layout only shows
+"API"** — you must **upgrade to the new Connections layout** first before Service Email
+appears (the "AI Agents: Connections UI Left-Rail Panel" pref / `AgentSurfacesBuilderPanel`).
+Then return to Setup and the configuration saves. (Confirmed across multiple field threads.)
+
+### 5.7 The Email Configuration form — required fields & the template placeholder
+
+Setup → **Agentforce for Service on Email** → New Configuration requires:
+- **Configuration Name** + **API Name** (auto-fills)
+- **Email Template** — the wrapper template, and it **must contain the literal
+  `[[[GENERATED_CONTENT]]]` placeholder** where the agent's reply is injected. Selecting a
+  template without it errors: *"The email template … must contain the [[[GENERATED_CONTENT]]]
+  placeholder."* Edit the template body to add it (e.g. `Dear …,\n\n[[[GENERATED_CONTENT]]]\n\n<signature>`).
+- **Agentforce Service Agent** = your agent
+- **Agentforce Service Agent Signature** + **Legal Disclosure** — both **mandatory** (any text)
+- **Reply All** — leave unchecked
+
+### 5.8 "We couldn't commit a version of this agent. Check Agent Script…" on activate
+
+Generic activate/commit failure. The trailing error number is a **transient trace ID, not
+the root cause**. Triage:
+1. Open the builder **Inspect panel** / browser **Network tab** → the failing
+   `publish`/`commit` response body usually names the real validation node (missing label,
+   description > 255 chars, bad action input param, restricted picklist value).
+2. **If all calls are 200 but commit still fails**, or a router-only/minimal agent fails,
+   it's likely a **platform bug** (open P1s on 262: `W-22963131`, `W-22961149`,
+   `W-22967688`) — file a case citing those; don't keep editing your script.
+3. Workaround: commit/activate via CLI instead of the UI —
+   `sf agent publish authoring-bundle` → `sf agent activate --api-name <name>`.
+4. Common fixable cause: an action with an invalid input param — **re-add the action fresh
+   from the Asset Library** so inputs auto-populate.
+
+### 5.9 Debugging "I sent email but no Case was created" — the decisive ladder
+
+Work top-down; each rung tells you which half of the pipeline is at fault.
+
+1. **Confirm the mail actually reached Salesforce — Email Log Files.** Setup → **Email Log
+   Files** → request a log → look for your inbound row: `Email Direction = Inbound`, Mail
+   Event `R` (received) then `D` (delivered), `SPF Status = Pass`, and **no** matching
+   `mailer-daemon` bounce. If you see that, **deliverability is NOT the problem** — the mail
+   arrived and the failure is downstream (case creation). A typo'd send-to address instead
+   shows a `mailer-daemon` bounce row.
+2. **Confirm records really are missing** (not just a UI filter):
+   ```bash
+   sf data query --query "SELECT Id, Subject, Origin, CreatedDate FROM Case WHERE CreatedDate = TODAY ORDER BY CreatedDate DESC" --target-org <alias>
+   sf data query --query "SELECT Id, Subject, FromAddress, Incoming, CreatedDate FROM EmailMessage ORDER BY CreatedDate DESC LIMIT 5" --target-org <alias>
+   ```
+   **Mail delivered (rung 1) + zero Case/EmailMessage = something rolled the transaction back.**
+3. **Surface the actual error — the single highest-value step.** Setup → **Email-to-Case** →
+   Edit → tick **"Notify sender about Email-to-Case processing errors"** → Save, then resend.
+   Salesforce emails the **exact failing element** (flow/trigger/limit) to the sender. With
+   this OFF (the default), every failure is silent — no bounce, no record, no clue.
+4. Only if rung 1 shows the mail never arrived do you chase deliverability (spam/greylisting
+   — Gmail senders are dropped more often than same-org `@salesforce.com` senders on trial orgs).
+
+### 5.10 ROOT CAUSE we hit: a pre-existing SDO demo Flow rolled back the Email-to-Case insert
+
+This is §4.6 in the wild, but from a **stock SDO demo flow you didn't write**, triggered on
+**EmailMessage** (not your object). The error notification (5.9 rung 3) named it exactly:
+
+> Flow `SDO_Service_Email_Message_On_Create_or_Update`, element `Notify_Case_Owner`
+> (Send Custom Notification): **Missing required input parameter: customNotifTypeId**
+
+What happened: inbound email → Case + EmailMessage created → this after-save flow on
+EmailMessage runs → it queries for a `CustomNotificationType` where `Desktop=true AND
+Mobile=true`, finds **none**, so `customNotifTypeId` is null → the Send Custom Notification
+action throws → **unhandled fault rolls back the entire Email-to-Case transaction** → no
+Case, no EmailMessage, no agent reply, and (notify off) no bounce. The trace even shows the
+Case/EmailMessage IDs that were created-then-rolled-back.
+
+**Find which flows can fire on Case/EmailMessage creation** (note: `FlowDefinitionView` is a
+**standard** object — querying it with `--use-tooling-api` fails `INVALID_TYPE`):
+```bash
+sf data query --query "SELECT ApiName, TriggerType, TriggerObjectOrEventLabel FROM FlowDefinitionView WHERE IsActive = true AND TriggerObjectOrEventLabel IN ('Case','EmailMessage')" --target-org <alias>
+```
+Then check the org has the records the flow depends on:
+```bash
+sf data query --query "SELECT DeveloperName, MasterLabel FROM CustomNotificationType" --target-org <alias>
+```
+
+**Fixes (fastest first):**
+- **Deactivate the offending SDO demo flow** if it's not part of your scenario (Setup →
+  Flows → Deactivate). The agent's email reply does not depend on `SDO_Service_Email_Message_On_Create_or_Update`.
+- **Or** create the missing dependency — a `CustomNotificationType` with **both Desktop and
+  Mobile** enabled (Setup → Notification Builder → Custom Notifications) so the flow's query succeeds.
+- **Or** add a fault path / null guard in the flow.
+
+**Takeaway:** when enabling any feature that creates records (Email-to-Case, Web-to-Case),
+audit **pre-existing record-triggered flows** on Case/EmailMessage first — a stock demo
+flow with a synchronous, throwing action will silently roll back your new pipeline.
+
+### 5.11 SOQL/CLI gotchas hit while debugging the email channel
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `No such column 'Name' on entity 'EmailServicesAddress'` | object has no `Name` field | use `LocalPart`, `EmailDomainName`, `IsActive` |
+| `sObject type 'FlowDefinitionView' is not supported` | queried with `--use-tooling-api` | it's a **standard** object — drop the tooling flag |
+| `sObject type 'EmailToCaseSettings' is not supported` | not a queryable sObject | configure via Setup UI / metadata, not SOQL |
+| Inbound row shows `D` (delivered) but still no Case | "delivered to MTA" ≠ "case created"; a downstream flow/limit dropped it | enable error notification (5.9 rung 3) |
+
 ---
 
 ## Pre-publish diagnostic checklist
@@ -473,3 +707,12 @@ and **can it be increased**?") ambiguous — accept it or add a clarifying turn.
 - [ ] Record-triggered Flow side-effects (email/callout) run on an **async-after-commit** path so they can't roll back the triggering insert (§4.6)
 - [ ] No reliance on outbound email in unverified trial orgs — Chatter/Task used for demo, email documented for production (§4.7)
 - [ ] `.agent` matches the CLI-generated grammar (`subagent` vs `topic`); action outputs referenced in prompt text are first captured into variables (§4.1, §4.2)
+- [ ] (Type switch) Treated Employee↔Service as a NEW agent with a unique `developer_name`; did NOT expect an in-place edit (§4.12)
+- [ ] (Headless/Agent API) Updated the hardcoded agent ID in the external client (e.g. n8n `SF_AGENT_ID`) after the type switch and smoke-tested the channel end-to-end (§4.13)
+- [ ] (MCP actions) Agent user has access to the MCP Named/External Credential; validated `mcpTool://` actions via the MCP SDK client because they may not surface in authoring-bundle preview (§4.14)
+- [ ] (Email channel) Routing address **Email Address** is a real, **Verified** inbox; test email sent to the **generated `@…case.salesforce.com` Email Services Address** pulled verbatim via SOQL (§5.3, §5.4)
+- [ ] (Email channel) Routing address **Case Owner = Einstein Agent User**; that user has Case Create/Read/Edit (§5.5)
+- [ ] (Email channel) **Service Email connection** added in Agent Builder (new Connections layout) and the agent version **activated** before saving the Email Configuration (§5.6)
+- [ ] (Email channel) Email Template contains the literal `[[[GENERATED_CONTENT]]]` placeholder; Signature + Legal Disclosure filled (§5.7)
+- [ ] (Email channel) **"Notify sender about Email-to-Case processing errors"** enabled while debugging so silent failures surface (§5.9)
+- [ ] (Email channel) Audited **pre-existing record-triggered flows on Case/EmailMessage** (e.g. stock SDO demo flows) — none throws synchronously and rolls back the Email-to-Case insert (§5.10)
