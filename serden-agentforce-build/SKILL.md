@@ -2,12 +2,14 @@
 name: serden-agentforce-build
 description: >-
   Hard-won gotchas from building production Agentforce agents end-to-end: Agent Script
-  authoring traps, Flow-backed action design, custom field visibility, admin setup, and
+  authoring traps, Flow-backed action design, custom field visibility, admin setup,
   service agents on Financial Services Cloud (FSC) over the email channel (invocable Apex
-  actions, Knowledge grounding, PCC hand-off, email deliverability). Use when building or
-  debugging an Agentforce agent, designing Flow/Apex backing logic for agent actions,
-  wiring action I/O types, handling picklist safety, making custom fields visible, or
-  diagnosing agent-user permission/email/flow failures. Pairs with /developing-agentforce.
+  actions, Knowledge grounding, PCC hand-off, email deliverability), and Agentforce Data
+  Library (ADL) semantic search grounding. Use when building or debugging an Agentforce
+  agent, designing Flow/Apex backing logic for agent actions, wiring action I/O types,
+  handling picklist safety, making custom fields visible, diagnosing agent-user
+  permission/email/flow failures, or provisioning and wiring an ADL for Knowledge grounding.
+  Pairs with /developing-agentforce.
 disable-model-invocation: true
 ---
 
@@ -419,7 +421,7 @@ a **Chatter post** (`actionType: chatterPost`, `text` + `subjectNameOrId = {!$Re
 — no deliverability dependency, never errors, and it's visible in the UI. Document that
 production reverts to email once a verified Org-Wide Email Address / domain is configured.
 
-### 4.8 SOSL Knowledge search is unreliable across user contexts → score in Apex
+### 4.8 SOSL Knowledge search is unreliable across user contexts → score in Apex or use ADL
 
 SOSL `FIND` relevance can return nothing for long natural-language queries (stopwords,
 `?`) and differs between admin and the agent user. For a small, bounded article set,
@@ -427,11 +429,20 @@ SOSL `FIND` relevance can return nothing for long natural-language queries (stop
 split the query into terms (drop stopwords, len ≥ 3), score each article by term hits
 (weight Title higher), return the top match. Reliable and user-context-independent.
 
+**For production:** replace in-Apex keyword scoring with an **Agentforce Data Library
+(ADL) KNOWLEDGE source type** + the platform `AnswerQuestionsWithKnowledge` standard
+action. Semantic retrieval, inline citations, and no custom Apex to maintain. See Part 6.
+
 ### 4.9 `Knowledge User` may be un-settable on the agent user's license
 
 `User.UserPermissionsKnowledgeUser = true` can fail with *"Knowledge User is not allowed
 for this License Type"* for the Einstein Agent User. Grant **`Knowledge__kav` object read
 via the permission set** instead, and run Knowledge Apex `without sharing`.
+
+**ADL alternative:** if using the `AnswerQuestionsWithKnowledge` standard action (Part 6),
+the `Knowledge User` flag is not required at all — the platform action runs in its own
+context. You still need `Knowledge__kav` object Read on the agent user's permission set
+for KNOWLEDGE-type ADL libraries (§6.3).
 
 ### 4.10 Route by INTENT (information vs action), not by topic keyword
 
@@ -710,6 +721,169 @@ User as specified on the routing address. With `System` it does not.
 
 ---
 
+## Part 6 — Agentforce Data Library (ADL) for Knowledge Grounding
+
+Lessons from provisioning a KNOWLEDGE-type ADL and wiring `AnswerQuestionsWithKnowledge`
+into a service agent as a production replacement for in-Apex keyword scoring.
+
+### 6.1 `retrieverId` populated ≠ chunks queryable (Day-0 race W-22773383)
+
+For **KNOWLEDGE source type** libraries, the pipeline reports `status: READY` and
+populates `retrieverId` before the background chunking job has actually processed any
+articles. Sending a grounded query during this window returns:
+
+```
+"knowledgeSummary": "Sorry, I can't find an answer based on the available articles."
+```
+
+This looks identical to a wiring error. **Do not diagnose it as broken wiring** — check
+the trace first (§6.6).
+
+**Gate:** declare the library ready only after a grounded test query returns non-empty
+`knowledgeSummary`, not after `retrieverId` appears. Chunking jobs run on platform-managed
+~10 min intervals. If still empty after 20+ min, force a re-index:
+
+```bash
+sf agent adl update -i <libraryId> --target-org <alias> --content-fields "Summary" --json
+```
+
+SFDRIVE libraries use JIT indexing and serve immediately after READY — this race only
+affects KNOWLEDGE.
+
+### 6.2 `sf agent adl update` is blocked while provisioning is in progress
+
+Immediately after `sf agent adl create`, an update to add content fields fails with:
+
+```
+INVALID_REQUEST_STATE: Cannot update library. An update or provisioning operation is currently in progress.
+```
+
+This is expected. The `rag_feature_config_id` (`ARFPC_<libraryId>`) is computable the
+instant the create response arrives, so **authoring doesn't block on indexing**. Write the
+`knowledge:` block and `AnswerQuestionsWithKnowledge` action into the `.agent` file
+immediately. Retry the `--content-fields` update once `retrieverId` is present.
+
+### 6.3 Three permission layers for ADL grounding — all required
+
+| Layer | What's needed | How to check |
+|-------|--------------|--------------|
+| **Data Cloud PSL/permset** | One of: `GenieDataPlatformStarterPsl` PSL, `GenieUserEnhancedSecurity` PS, `DataCloudUser` PS, `DataCloudArchitect` PS (priority in that order) | `SELECT PermissionSet.Name FROM PermissionSetAssignment WHERE Assignee.Username='<agent-user>'` + `SELECT DeveloperName FROM PermissionSetLicenseAssign WHERE Assignee.Username='<agent-user>'` |
+| **`Knowledge__kav` object Read + field FLS** | Object Read on `Knowledge__kav`; standard fields (Title, ArticleNumber, Summary) are always-readable once object Read is granted — only custom fields need explicit FLS | `SELECT SObjectType, PermissionsRead FROM ObjectPermissions WHERE ParentId IN (SELECT PermissionSetId FROM PermissionSetAssignment WHERE AssigneeId='<id>') AND SObjectType='Knowledge__kav'` |
+| **Data Space scope on the permset** | The assigned Data Cloud permset must have the `default` data space scoped — **UI-only, no API**: Setup → Permission Sets → \<permset\> → Apps → Data Cloud Data Space Management → Edit → add `default` → Save | No SOQL check available; if the first two layers are confirmed and `knowledgeSummary` is still empty, this is the missing layer |
+
+All three must be correct. A grounded query silently returns empty `knowledgeSummary` if
+any layer is missing — there is no error message.
+
+**Discovery-then-assign pattern** (don't hardcode permset names — they vary by org shape):
+
+```bash
+# Find available Data Cloud permsets
+sf data query --target-org <alias> --json \
+  -q "SELECT Id, Name, Label FROM PermissionSet WHERE Name IN ('GenieUserEnhancedSecurity','DataCloudUser','DataCloudArchitect','CopilotSalesforceAdmin')"
+
+# Find available PSLs
+sf data query --target-org <alias> --json \
+  -q "SELECT Id, DeveloperName FROM PermissionSetLicense WHERE DeveloperName IN ('GenieDataPlatformStarterPsl','GenieUserEnhancedSecurity')"
+
+# Assign PSL (highest priority if available)
+sf data create record --target-org <alias> --json \
+  --sobject PermissionSetLicenseAssign \
+  --values "AssigneeId=<userId> PermissionSetLicenseId=<pslId>"
+
+# Assign permset
+sf data create record --target-org <alias> --json \
+  --sobject PermissionSetAssignment \
+  --values "AssigneeId=<userId> PermissionSetId=<psId>"
+```
+
+### 6.4 Permset API name vs UI label — they differ for Data Cloud permsets
+
+`GenieUserEnhancedSecurity` is displayed in Setup as **"Data Cloud User"**. Always give
+both the API name and the UI label when directing someone to a permset in Setup, or they
+will look for the API name and not find it.
+
+Other common mismatches in the same family:
+- `GenieAdmin` → "Data Cloud Architect" in UI
+- `GenieMarketingAdmin` → "(Legacy) Data Cloud Marketing Admin" in UI
+
+### 6.5 `featureAssignments: []` is normal — don't use it as a health signal
+
+The `sf agent adl get` response always shows `"featureAssignments": []` even when
+permissions are correctly configured and the library is READY. It is not a diagnostic
+indicator.
+
+### 6.6 Traces are the diagnostic tool for empty `knowledgeSummary`
+
+The agent's text response ("I don't have that information") looks the same whether:
+(a) the action never fired, (b) it fired but the library is still indexing, or
+(c) it fired but the agent user lacks Data Space scope.
+
+**Always read the trace** before concluding the action is broken:
+
+```bash
+python3 -c "
+import json, glob
+for t in sorted(glob.glob('.sfdx/agents/<bundle>/sessions/<id>/traces/*.json')):
+    with open(t) as f: d = json.load(f)
+    def find(obj):
+        if isinstance(obj, dict):
+            if obj.get('type') == 'FunctionStep':
+                fn = obj.get('function', {})
+                print('ACTION:', fn.get('name'))
+                print('  inputs:', fn.get('input', {}))
+                print('  knowledgeSummary:', fn.get('output', {}).get('knowledgeSummary', 'NOT PRESENT'))
+            for v in obj.values(): find(v)
+        elif isinstance(obj, list):
+            for i in obj: find(i)
+    find(d)
+"
+```
+
+Interpretation:
+
+| Trace evidence | Diagnosis |
+|---------------|-----------|
+| No `FunctionStep` for `AnswerQuestionsWithKnowledge` | Action not wired or `available when` guard blocking |
+| `FunctionStep` present, `ragFeatureConfigId` wrong/missing | `knowledge:` block missing or misordered (must be before `language:`) |
+| `FunctionStep` present, correct inputs, `knowledgeSummary: "Sorry…"` | Platform indexing lag (§6.1) or Data Space scope missing (§6.3) |
+| `FunctionStep` present, correct inputs, non-empty `knowledgeSummary` | Working correctly |
+
+### 6.7 Anti-hallucination instruction ordering in `AnswerQuestionsWithKnowledge`
+
+The "call first, then check empty" ordering in the reasoning block is critical. If you
+write the empty-check condition first, the LLM interprets it as a pre-condition (why call
+at all if it might be empty?) and short-circuits — the action never fires.
+
+**Correct ordering:**
+
+```agentscript
+reasoning:
+    instructions: ->
+        | ALWAYS call AnswerQuestionsWithKnowledge FIRST for every product/pricing/process
+          question. Never answer from your own knowledge — always call the action first.
+        | After the action returns: if @outputs.AnswerQuestionsWithKnowledge.knowledgeSummary
+          is empty or None, respond: "<domain-specific fallback>". Do NOT compose an answer
+          from prior knowledge.
+        | If knowledgeSummary has content, answer ONLY using that content. Quote exact figures.
+```
+
+The first instruction forces execution; the empty-check is a post-condition. Reversing the
+order causes the planner to skip the action entirely (confirmed in testing).
+
+### 6.8 Intent-routing still fires before `product_and_process` — wording matters
+
+Even with correct ADL wiring, a query like *"a debit order was collected in error"* may
+route to `service_requests` (logging a Case) rather than `product_and_process`, because
+"collected in error" signals an action intent to the router. The agent is behaving
+correctly — it's the utterance wording that's wrong.
+
+**Rule:** In demo scripts and test utterances, phrase information queries in pure question
+form: *"how does X work"*, *"what are the rules for X"*, *"what is the policy on X"*.
+Remove verbs that imply bank action (collected, reversed, cancelled, charged). This is
+§4.10 in practice — the fix is the utterance, not the agent code.
+
+---
+
 ## Pre-publish diagnostic checklist
 
 - [ ] `sf agent validate authoring-bundle` passes with zero errors
@@ -738,3 +912,11 @@ User as specified on the routing address. With `System` it does not.
 - [ ] (Email channel) **"Notify sender about Email-to-Case processing errors"** enabled while debugging so silent failures surface (§5.9)
 - [ ] (Email channel) Audited **pre-existing record-triggered flows on Case/EmailMessage** (e.g. stock SDO demo flows) — none throws synchronously and rolls back the Email-to-Case insert (§5.10)
 - [ ] (Email channel) Setup → **Support Settings** → **Automated Case User** set to the **admin user** (not `System`) — otherwise case ownership ignores the routing address setting (§5.11)
+- [ ] (ADL / Knowledge grounding) `sf agent adl get` shows `status: READY` and `retrieverId` is populated before wiring
+- [ ] (ADL / Knowledge grounding) Waited for chunking to complete (test query returns non-empty `knowledgeSummary`) — READY + retrieverId is not sufficient (§6.1)
+- [ ] (ADL / Knowledge grounding) Agent user has a Data Cloud PSL or permset assigned (`GenieDataPlatformStarterPsl` PSL preferred; `GenieUserEnhancedSecurity` / "Data Cloud User" permset as fallback) (§6.3)
+- [ ] (ADL / Knowledge grounding) Agent user has `Knowledge__kav` object Read on at least one assigned permission set (§6.3)
+- [ ] (ADL / Knowledge grounding) The assigned Data Cloud permset has the `default` data space scoped in Setup → Permission Sets → Apps → Data Cloud Data Space Management (UI-only; no API check available) (§6.3)
+- [ ] (ADL / Knowledge grounding) `knowledge:` block appears **before** the `language:` block in the agent config, and `rag_feature_config_id` value matches `ARFPC_<libraryId>` (§6.2)
+- [ ] (ADL / Knowledge grounding) Anti-hallucination instruction in reasoning block is in the correct order: "always call first" THEN empty-check THEN use-content (§6.7)
+- [ ] (ADL / Knowledge grounding) Traced a `FunctionStep` for `AnswerQuestionsWithKnowledge` with correct `ragFeatureConfigId` and non-empty `knowledgeSummary` in at least one preview session (§6.6)
